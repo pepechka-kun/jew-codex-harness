@@ -26,6 +26,8 @@ class InstallCoreTests(unittest.TestCase):
         platform_patch.start()
         self.addCleanup(platform_patch.stop)
         self.root = Path(self.temp.name)
+        # Keep launchd checkpoint inventory away from the real installed service.
+        self.enterContext(mock.patch("harness.platforms.macos.Path.home", return_value=self.root))
         if os.name == "nt":
             from harness.platforms.windows import _private_state_dir
             _private_state_dir(self.root, create=False)
@@ -528,7 +530,7 @@ class InstallCoreTests(unittest.TestCase):
             ("config.toml", lambda path: path.write_text(path.read_text().replace(
                 core._toml_string(str(REPO / "integrations/workers/mcp.py")),
                 core._toml_string("/foreign/mcp.py")))),
-            ("hooks.json", lambda path: path.write_text(path.read_text().replace(" pre_tool", " foreign_tool"))),
+            ("hooks.json", lambda path: path.write_text(path.read_text().replace("lifecycle_hook", "foreign_tool"))),
             ("AGENTS.md", lambda path: path.write_text(path.read_text().replace("safeBrowserClick", "rawClick"))),
         )
         for relative, mutate in cases:

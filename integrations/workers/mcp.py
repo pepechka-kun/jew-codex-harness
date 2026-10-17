@@ -3,6 +3,8 @@
 import json
 import math
 import os
+from pathlib import Path
+import uuid
 import sys
 import time
 
@@ -28,7 +30,7 @@ TASK_SCHEMA = {"type": "object", "required": ["request_id", "goal", "cwd", "allo
                          "items": {"type": "string", "enum": ["browser", "computer", "pdf", "documents"]}}}}
 WAIT = {"type": "number", "minimum": 0, "maximum": 50}
 TOOLS = [
-    {"name": "submit", "description": "Start one owned Codex worker on jev/auto. Jev applies Plus, sticky Gemini, Opus, Gonka GLM, Gonka DeepSeek, Wally GLM, then Luna 6.",
+    {"name": "submit", "description": "Start one owned Codex worker on jev/auto. Uses the configured provider sequence; outside CanvasTTY only.",
      "inputSchema": TASK_SCHEMA},
     {"name": "execute", "description": "Start an owned jev/auto worker and wait up to 50 seconds in code; use collect for longer tasks.",
      "inputSchema": {**TASK_SCHEMA, "properties": {**TASK_SCHEMA["properties"], "wait_seconds": WAIT}}},
@@ -37,6 +39,11 @@ TOOLS = [
                        "properties": {"task_id": {"type": "string"}, "wait_seconds": WAIT}}}
       for name in ("status", "collect", "cancel")),
 ]
+
+
+HOOK_TOOL = {"name": "lifecycle_hook", "description": "Internal Codex lifecycle callback; do not invoke as an agent tool.",
+             "inputSchema": {"type": "object", "required": ["event"],
+                             "properties": {"event": {"type": "object"}}, "additionalProperties": False}}
 
 
 def validate_wait(seconds):
@@ -55,6 +62,20 @@ def wait_for(task_id, seconds, get_status, active):
     return current
 
 
+def canvas_owned():
+    """Availability hint only; native CanvasTTY independently owns permissions."""
+    if os.environ.get("CANVASTTY_RUNTIME_PROVIDER") != "codex":
+        return False
+    if not all(os.environ.get(key, "").strip() for key in (
+        "CANVASTTY_RUNTIME_ADDRESS", "CANVASTTY_RUNTIME_TERMINAL_SESSION_ID", "CANVASTTY_RUNTIME_CAPABILITY")):
+        return False
+    try:
+        uuid.UUID(os.environ["CANVASTTY_RUNTIME_TERMINAL_SESSION_ID"])
+    except ValueError:
+        return False
+    return True
+
+
 def handle(message):
     if not isinstance(message, dict):
         raise ValueError("JSON-RPC message must be an object")
@@ -65,8 +86,19 @@ def handle(message):
     if method == "ping":
         return {}
     if method == "tools/list":
-        return {"tools": TOOLS}
+        return {"tools": [HOOK_TOOL] + ([] if canvas_owned() or os.environ.get("JEV_WORKER_MANIFEST") else TOOLS)}
     if method == "tools/call":
+        params = message.get("params", {})
+        if params.get("name") == "lifecycle_hook":
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "jev/global"))
+            from hook_dispatch import dispatch
+            output = dispatch(params.get("arguments", {}).get("event"), params.get("_meta"))
+            return {"content": [{"type": "text", "text": json.dumps(output, ensure_ascii=False)}],
+                    "structuredContent": output, "isError": False}
+        if os.environ.get("JEV_WORKER_MANIFEST"):
+            return {"content": [{"type": "text", "text": "Bounded workers cannot delegate to other workers."}], "isError": True}
+        if canvas_owned():
+            return {"content": [{"type": "text", "text": "Use CanvasTTY canvastty_agents for this session; standalone jev-workers are unavailable here."}], "isError": True}
         params = message.get("params", {})
         name = params.get("name")
         arguments = params.get("arguments", {})

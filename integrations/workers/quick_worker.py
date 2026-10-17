@@ -101,7 +101,9 @@ def command(task):
         enabled_plugins.add("documents@openai-primary-runtime")
     flags = []
     for name in config.get("mcp_servers", {}):
-        if name not in enabled_mcp:
+        if name == "jev-workers" and model == AUTO_MODEL:
+            flags.extend(["-c", 'mcp_servers."jev-workers".enabled_tools=["lifecycle_hook"]'])
+        elif name not in enabled_mcp:
             flags.extend(["-c", f"mcp_servers.{name}.enabled=false"])
     for name in config.get("plugins", {}):
         if name not in enabled_plugins:

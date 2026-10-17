@@ -83,7 +83,7 @@ def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _hook_entries(repo: Path) -> dict:
+def _legacy_hook_entries(repo: Path) -> dict:
     script = repo / "integrations/jev/global/codex_hook.py"
     import shlex
     command = shlex.join([sys.executable, str(script)]) if os.name != "nt" else subprocess.list2cmdline([sys.executable, str(script)])
@@ -100,21 +100,97 @@ def _hook_entries(repo: Path) -> dict:
     }
 
 
+# MCP environment is independent of shell_environment_policy. Never expose runtime
+# capabilities by widening the shell's inherited environment.
+WORKER_ENV = (
+    "CANVASTTY_RUNTIME_PROVIDER", "CANVASTTY_RUNTIME_ADDRESS",
+    "CANVASTTY_RUNTIME_TERMINAL_SESSION_ID", "CANVASTTY_RUNTIME_CAPABILITY",
+    "CODEX_HOME", "JEV_GLOBAL_STATE_DIR", "JEV_GLOBAL_ASK_URL",
+    "JEV_WORKER_STATE_DIR", "JEV_WORKER_MANIFEST", "JEV_WORKER_MANIFEST_SHA256", "JEV_WORKER_BACKEND",
+)
+
+
+def _worker_config(repo: Path) -> dict:
+    return {"command": sys.executable, "args": [str(repo / "integrations/workers/mcp.py")],
+            "required": True, "env_vars": list(WORKER_ENV)}
+
+
+def _hook_entries(repo: Path) -> dict:
+    common = ("session_id", "transcript_path", "cwd", "hook_event_name", "model")
+    fields = {
+        "UserPromptSubmit": ("turn_id", "prompt"),
+        "PreToolUse": ("turn_id", "tool_name", "tool_use_id", "tool_input"),
+        "PostToolUse": ("turn_id", "tool_name", "tool_use_id", "tool_input", "tool_response"),
+        "PreCompact": ("turn_id", "trigger"), "SessionStart": ("source",),
+    }
+    entries = _legacy_hook_entries(repo)
+    for event, rows in entries.items():
+        previous = rows[0]["hooks"][0]
+        handler = {"type": "mcp_tool", "server": "jev-workers", "tool": "lifecycle_hook",
+                   "input": {"event": {name: "${" + name + "}" for name in common + fields[event]}},
+                   "timeout": previous["timeout"]}
+        rows[0]["hooks"] = [handler]
+    return entries
+
+
 def merge_hooks(existing: dict, repo: Path) -> dict:
     if not isinstance(existing, dict) or not isinstance(existing.get("hooks", {}), dict):
         raise InstallError("hooks.json must contain an object with a hooks object")
     result = json.loads(json.dumps(existing))
     hooks = result.setdefault("hooks", {})
+    legacy = _legacy_hook_entries(repo)
     for event, entries in _hook_entries(repo).items():
         rows = hooks.setdefault(event, [])
         if not isinstance(rows, list):
             raise InstallError(f"hooks.json {event} must be an array")
+        old_commands = {row["hooks"][0]["command"] for row in legacy[event]}
+        for row in rows:
+            if isinstance(row, dict) and row not in legacy[event] and row not in entries and any(
+                isinstance(hook, dict) and (hook.get("command") in old_commands or
+                    (hook.get("type") == "mcp_tool" and hook.get("server") == "jev-workers"
+                     and hook.get("tool") == "lifecycle_hook")) for hook in row.get("hooks", [])
+            ):
+                raise InstallError("Existing Jev hook differs; migration requires review")
+        rows[:] = [row for row in rows if row not in legacy[event]]
         for entry in entries:
-            command = entry["hooks"][0]["command"]
-            if not any(command == hook.get("command") for row in rows if isinstance(row, dict)
-                       for hook in row.get("hooks", []) if isinstance(hook, dict)):
+            if entry not in rows:
                 rows.append(entry)
     return result
+
+
+def _protect_hook_environment(source: str, config: dict) -> str:
+    """Keep the runtime capability out of shell tools, without broadening inheritance."""
+    policy = config.get("shell_environment_policy", {})
+    excluded = policy.get("exclude", [])
+    if not isinstance(excluded, list) or not all(isinstance(value, str) for value in excluded):
+        raise InstallError("Invalid shell environment exclusions")
+    name = "CANVASTTY_RUNTIME_CAPABILITY"
+    if name in excluded:
+        return source
+    value = json.dumps([*excluded, name])
+    header = re.search(r"(?m)^\[shell_environment_policy\][ \t]*(?:#[^\n]*)?$", source)
+    if not header:
+        if policy:
+            raise InstallError("Shell environment policy layout differs; migration requires review")
+        return source.rstrip("\n") + "\n\n[shell_environment_policy]\nexclude = " + value + "\n"
+    tail = source[header.end():]
+    boundary = re.search(r"(?m)^\[", tail)
+    end = header.end() + boundary.start() if boundary else len(source)
+    body = source[header.end():end]
+    assignment = re.search(r"(?m)^[ \t]*(?:exclude|\"exclude\"|'exclude')[ \t]*=", body)
+    if not assignment:
+        return source[:header.end()] + "\nexclude = " + value + source[header.end():]
+    # Parse successive line prefixes so quoted brackets and multiline arrays remain safe.
+    start = header.end() + assignment.start()
+    for line in re.finditer(r"\n|$", source[start:end]):
+        stop = start + line.end()
+        try:
+            parsed = tomllib.loads(source[start:stop])
+        except tomllib.TOMLDecodeError:
+            continue
+        if parsed.get("exclude") == excluded:
+            return source[:start] + "exclude = " + value + "\n" + source[stop:]
+    raise InstallError("Shell environment exclusion layout differs; migration requires review")
 
 
 def merge_config(existing: str, repo: Path) -> str:
@@ -122,14 +198,25 @@ def merge_config(existing: str, repo: Path) -> str:
         config = tomllib.loads(existing)
     except tomllib.TOMLDecodeError as exc:
         raise InstallError("Existing config.toml is invalid TOML") from exc
+    existing = _protect_hook_environment(existing, config)
     current = config.get("mcp_servers", {}).get("jev-workers")
-    if current is not None:
-        expected = {"command": sys.executable, "args": [str(repo / "integrations/workers/mcp.py")]}
-        if current != expected:
-            raise InstallError("Existing jev-workers MCP differs; migration requires review")
+    expected = _worker_config(repo)
+    if current == expected:
         return existing
+    if current is not None:
+        legacy = {"command": sys.executable, "args": expected["args"]}
+        if current != legacy:
+            raise InstallError("Existing jev-workers MCP differs; migration requires review")
+        # Upgrade only the exact installer-owned legacy stanza; retain other TOML verbatim.
+        header = r"(?m)^\[mcp_servers\.(?:jev-workers|\"jev-workers\"|'jev-workers')\][ \t]*(?:#[^\n]*)?$"
+        match = re.search(header, existing)
+        if not match:
+            raise InstallError("Existing jev-workers MCP layout differs; migration requires review")
+        addition = "\nrequired = true\nenv_vars = " + json.dumps(list(WORKER_ENV)) + "\n"
+        return existing[:match.end()] + addition + existing[match.end():]
     section = "\n[mcp_servers.jev-workers]\ncommand = " + _toml_string(sys.executable)
-    section += "\nargs = [" + _toml_string(str(repo / "integrations/workers/mcp.py")) + "]\n"
+    section += "\nargs = [" + _toml_string(expected["args"][0]) + "]\n"
+    section += "required = true\nenv_vars = " + json.dumps(list(WORKER_ENV)) + "\n"
     return existing.rstrip("\n") + "\n" + section
 
 
@@ -339,7 +426,8 @@ def _owned_payload(home: Path, repo: Path, relative: str) -> object:
         servers = config.get("mcp_servers", {})
         manifest = json.loads((home / "jev-harness/manifest.json").read_text(encoding="utf-8"))
         names = ["jev-workers"] + (["jev-browser"] if manifest.get("browser_enabled") else [])
-        return {name: servers.get(name) for name in names}
+        return {**{name: servers.get(name) for name in names},
+                "@private-hook-context": "CANVASTTY_RUNTIME_CAPABILITY" in config.get("shell_environment_policy", {}).get("exclude", [])}
     if relative == "hooks.json":
         hooks = json.loads(path.read_text(encoding="utf-8")).get("hooks", {})
         return {event: [row for row in entries if row in hooks.get(event, [])]
@@ -361,8 +449,7 @@ def _expected_owned_fingerprint(home: Path, repo: Path, relative: str) -> str:
         config = tomllib.loads((home / relative).read_text(encoding="utf-8"))
         current = config.get("mcp_servers", {})
         manifest = json.loads((home / "jev-harness/manifest.json").read_text(encoding="utf-8"))
-        expected = {"jev-workers": {"command": sys.executable,
-                                    "args": [str(repo / "integrations/workers/mcp.py")]}}
+        expected = {"jev-workers": _worker_config(repo), "@private-hook-context": True}
         if manifest.get("browser_enabled"):
             from .browser_config import IDENTITY_ENV
             node = current.get("jev-browser", {}).get("command")
@@ -762,8 +849,8 @@ def verify(codex_home: Path) -> dict:
     config = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
     hooks = json.loads((home / "hooks.json").read_text(encoding="utf-8"))
     mcp = config.get("mcp_servers", {})
-    worker_config = mcp.get("jev-workers") == {
-        "command": sys.executable, "args": [str(repo / "integrations/workers/mcp.py")]}
+    worker_config = (mcp.get("jev-workers") == _worker_config(repo)
+                     and "CANVASTTY_RUNTIME_CAPABILITY" in config.get("shell_environment_policy", {}).get("exclude", []))
     browser_config = True
     if manifest.get("browser_enabled"):
         from .browser_config import IDENTITY_ENV

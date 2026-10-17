@@ -31,6 +31,13 @@ def hook_ready():
         import shlex
         command = (subprocess.list2cmdline([sys.executable, str(script)]) if os.name == "nt"
                    else shlex.join([sys.executable, str(script)])) + " pre_tool"
+        repo = Path(__file__).resolve().parents[2]
+        sys.path.insert(0, str(repo))
+        from harness.core import _hook_entries, _worker_config
+        config = tomllib.loads((home / "config.toml").read_text())
+        if (_hook_entries(repo)["PreToolUse"][0] in hooks
+                and config.get("mcp_servers", {}).get("jev-workers") == _worker_config(repo)):
+            return
         if any(entry.get("matcher") in (None, ".*", "^.*$") and any(
                 hook.get("command") == command and hook.get("type") == "command"
                 and hook.get("enabled", True) is True for hook in entry.get("hooks", [])) for entry in hooks):
@@ -234,7 +241,10 @@ def _run_task(task_id):
         command.extend(["-c", 'windows.sandbox="unelevated"'])
     for section in ("mcp_servers", "plugins"):
         for name in config.get(section, {}):
-            command.extend(["-c", section + "." + json.dumps(name) + ".enabled=false"])
+            if section == "mcp_servers" and name == "jev-workers":
+                command.extend(["-c", 'mcp_servers."jev-workers".enabled_tools=["lifecycle_hook"]'])
+            else:
+                command.extend(["-c", section + "." + json.dumps(name) + ".enabled=false"])
     command.extend(["--output-last-message", str(answer), "-"])
     env = {**os.environ, "JEV_WORKER_MANIFEST": str(directory / "task.json"),
            "JEV_WORKER_MANIFEST_SHA256": hashlib.sha256((directory / "task.json").read_bytes()).hexdigest(),

@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKERS = ROOT / "integrations" / "workers"
 sys.path.insert(0, str(WORKERS))
 import portable
-from harness.core import _hook_entries
+from harness.core import _hook_entries, merge_config
 REAL_POPEN = subprocess.Popen
 
 
@@ -28,7 +28,7 @@ class PortableWorkersTest(unittest.TestCase):
         self.state = self.base / "private-state"
         self.home = self.base / "profile"
         self.home.mkdir()
-        (self.home / "config.toml").write_text('[mcp_servers.jev-workers]\ncommand = "python"\n', encoding="utf-8")
+        (self.home / "config.toml").write_text(merge_config("", ROOT), encoding="utf-8")
         (self.home / "hooks.json").write_text(json.dumps({"hooks": _hook_entries(ROOT)}), encoding="utf-8")
         patcher = mock.patch.dict(os.environ, {"JEV_PORTABLE_WORKER_STATE": str(self.state),
                                                "JEV_WORKER_STATE_DIR": str(self.state),
@@ -118,7 +118,7 @@ class PortableWorkersTest(unittest.TestCase):
         for configured in (None, "elevated", "unelevated", "mxc"):
             with self.subTest(configured=configured):
                 config = "" if configured is None else '[windows]\nsandbox = "' + configured + '"\n'
-                (self.home / "config.toml").write_text(config, encoding="utf-8")
+                (self.home / "config.toml").write_text(merge_config(config, ROOT), encoding="utf-8")
                 with mock.patch.object(portable.shutil, "which", return_value="/fake/codex"), \
                      mock.patch.object(portable.subprocess, "Popen") as launch:
                     task_id = portable.submit({**self.task, "request_id": str(configured)})["task_id"]
@@ -187,7 +187,7 @@ class PortableWorkersTest(unittest.TestCase):
             self.assertIn("--sandbox", args[0])
             self.assertIn("read-only", args[0])
             self.assertIn("jev/auto", args[0])
-            self.assertIn('mcp_servers."jev-workers".enabled=false', args[0])
+            self.assertIn('mcp_servers."jev-workers".enabled_tools=["lifecycle_hook"]', args[0])
             self.assertEqual(Path(kwargs["stdout"].name).name, "events.jsonl")
             self.assertIs(kwargs["stderr"], portable.subprocess.DEVNULL)
             self.assertEqual(portable.collect(task_id)["summary"], "safe answer")
@@ -204,7 +204,7 @@ class PortableWorkersTest(unittest.TestCase):
                 answer = module.handle({"method": "tools/call", "params": {"name": "submit", "arguments": self.task}})
             self.assertFalse(answer["isError"])
             self.assertEqual(json.loads(answer["content"][0]["text"])["task_id"], "test")
-            self.assertEqual(len(module.handle({"method": "tools/list"})["tools"]), 5)
+            self.assertEqual(len([t for t in module.handle({"method": "tools/list"})["tools"] if t["name"] != "lifecycle_hook"]), 5)
 
     def test_mcp_preserves_canvastty_backend_inside_its_isolation(self):
         native = mock.Mock()
