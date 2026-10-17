@@ -153,6 +153,27 @@ class PortableReportPathTests(unittest.TestCase):
         self.assertNotIn("$0.00", output.getvalue())
         self.assertNotIn("Оценка частичная", output.getvalue())
 
+    def test_manual_ladder_requests_do_not_change_automatic_costs_or_source_digest(self):
+        log = self.base / "routing.jsonl"
+        now = datetime(2026, 9, 24, 19, 51, tzinfo=ZoneInfo("UTC"))
+        automatic = {"at": "2026-09-24T18:00:00+00:00", "ladder_stage": "primary",
+                     "attempts": [{"model": "gpt-6-luna", "http_status": 200,
+                       "terminal_type": "response.completed",
+                       "usage": {"input_tokens": 1000, "output_tokens": 100}}]}
+        for source in (None, 'jev', 'lease', 'technical_fallback'):
+            with self.subTest(source=source):
+                row = {**automatic, **({"decision_source": source} if source else {})}
+                log.write_text(json.dumps(row) + '\n')
+                expected = api_cost.report(24, routing_log=log, now=now)
+                for model in ('codex/gpt-6.1-sol', 'gonkagate/synthetic-model'):
+                    manual = {**automatic, 'decision_source': 'manual',
+                              'attempts': [{'model': model, 'usage': {'input_tokens': 999999, 'output_tokens': 999999}}]}
+                    log.write_text(json.dumps(manual) + '\n' + json.dumps(row) + '\n')
+                    actual = api_cost.report(24, routing_log=log, now=now)
+                    for key in ('routed_calls', 'totals', 'source_rows_sha256', 'priced_attempts'):
+                        self.assertEqual(actual[key], expected[key], key)
+                    self.assertFalse(api_cost.gonka_used(log, 24, now=now))
+
     def test_native_only_cost_report_needs_no_gonka_price_request(self):
         log = self.base / "native.jsonl"
         now = datetime(2026, 9, 24, 19, 51, tzinfo=ZoneInfo("Europe/Moscow"))

@@ -2241,6 +2241,7 @@ class Handler(BaseHTTPRequestHandler):
         self._project_policy = None
         self._policy_ladder = None
         routing_off = os.path.exists(OFF_PATH)
+        shadow_enabled = os.path.exists(SHADOW_PATH)
         if os.environ.get("JEV_LADDER_MODE") == "active" and not routing_off:
             try:
                 self._policy_ladder = _provider_ladder()
@@ -2255,9 +2256,10 @@ class Handler(BaseHTTPRequestHandler):
         leased = route_lease(scope, payload, step)
         available_models = self._policy_ladder.available_models() if self._policy_ladder else TIERS
         fixed_model = payload.get("model") if payload.get("model") in TIERS else None
+        shadow_routes_native = shadow_enabled and not self._project_policy and fixed_model is None
         try:
             candidates = (self._policy_ladder.model_candidates()
-                          if self._policy_ladder and fixed_model is None else available_models)
+                          if self._policy_ladder and fixed_model is None and not shadow_routes_native else available_models)
         except (OSError, ValueError, RuntimeError):
             return self._json(503, {"error": {"message": "provider model health unavailable"}})
         models = automatic_models(candidates)
@@ -2335,14 +2337,12 @@ class Handler(BaseHTTPRequestHandler):
                 decision_source = "technical_fallback"
 
         if (not routing_off and os.environ.get("JEV_LADDER_MODE") == "active"
-                and (self._project_policy or fixed_model is not None or (not os.path.exists(OFF_PATH) and not os.path.exists(SHADOW_PATH)
+                and (self._project_policy or fixed_model is not None or (not shadow_enabled
                 and isinstance(payload.get("prompt_cache_key"), str)
                 and payload["prompt_cache_key"].strip()))):
             return self._serve_ladder(payload, scope, model, effort, decision, step,
                                       jev_usage, stream_requested, debug, t0, jev_ms,
                                       decision_source, routing_gate=gate)
-
-        shadow_enabled = os.path.exists(SHADOW_PATH)
 
         would = None
         if shadow_enabled:

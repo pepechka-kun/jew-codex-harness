@@ -219,6 +219,7 @@ def report(hours=24, *, routing_log=None, gonka_prices=None, now=None):
         log_first = at if log_first is None or at < log_first else log_first
         log_last = at if log_last is None or at > log_last else log_last
         if (at < cutoff or at > now or not isinstance(row.get("attempts"), list)
+                or row.get("decision_source") == "manual"
                 or ("ladder_stage" not in row and "gate" not in row)):
             continue
         calls += 1
@@ -424,7 +425,7 @@ def gonka_used(routing_log, hours, now=None):
         except ValueError:
             continue
         at = at.replace(tzinfo=now.tzinfo) if at.tzinfo is None else at.astimezone(now.tzinfo)
-        if at < cutoff or at > now:
+        if at < cutoff or at > now or row.get("decision_source") == "manual":
             continue
         if any(isinstance(attempt, dict) and str(attempt.get("model") or "").startswith("gonkagate/")
                for attempt in row.get("attempts") or []):

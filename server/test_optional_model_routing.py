@@ -178,6 +178,41 @@ class OptionalModelRouting(unittest.TestCase):
                         self.assertEqual(logged.call_args.args[0]['jev_error_reason'], 'timeout')
                         self.assertNotIn('fixture-private', str(logged.call_args))
 
+    def test_shadow_uses_structural_models_and_serves_native_during_destination_cooldown(self):
+        for disable_astra in ('0', '1'):
+            with self.subTest(disable_astra=disable_astra), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                for name in ('OFF_PATH', 'SHADOW_PATH', 'DEBUG_PATH', 'DRY_STATE_PATH', 'SIGNATURE_PATH'):
+                    stack.enter_context(mock.patch.object(jev, name, str(Path(directory) / name)))
+                Path(jev.SHADOW_PATH).touch()
+                stack.enter_context(mock.patch.object(jev, 'STATE', directory))
+                stack.enter_context(mock.patch.dict(os.environ, {'JEV_LADDER_MODE': 'active',
+                                     'JEV_DISABLE_AUTO_ASTRA': disable_astra}))
+                ladder = Ladder({'providers': [{'id': 'primary', 'model': 'gateway/fixed'}]},
+                                Path(directory) / 'state.json')
+                ladder.advance('prior', ladder.route('prior', SOL61, 'medium'),
+                               'model_unavailable', cooldown_seconds=300)
+                self.assertEqual(ladder.model_candidates(), ())
+                health = stack.enter_context(mock.patch.object(ladder, 'model_candidates', side_effect=AssertionError('shadow must not use destination health')))
+                stack.enter_context(mock.patch.object(jev, '_provider_ladder', return_value=ladder))
+                stack.enter_context(mock.patch.object(jev, 'load_key', return_value='synthetic'))
+                result = {'answers': {key: {'choice': value, 'confidence': 0.99}
+                          for key, value in route_choice('gpt-6-luna', 'low').items()}}
+                classify = stack.enter_context(mock.patch.object(jev, 'call_jev_routed', return_value=result))
+                for name in ('log_line', 'remember_cache_model', 'remember_route_lease', 'route_lease', 'native_dry'):
+                    stack.enter_context(mock.patch.object(jev, name, return_value=None))
+                handler = object.__new__(jev.Handler)
+                handler.path = '/v1/responses'
+                handler._body = lambda _: {'model': 'jev/auto', 'input': 'synthetic', 'prompt_cache_key': 'synthetic-shadow'}
+                handler._json = mock.Mock()
+                handler._serve_ladder = mock.Mock()
+                handler._forward = mock.Mock(return_value=(200, 'json', 'application/json', False, None, None))
+                handler._post()
+                health.assert_not_called()
+                classify.assert_called_once()
+                handler._json.assert_not_called()
+                handler._serve_ladder.assert_not_called()
+                self.assertEqual(handler._forward.call_args.args[0]['model'], jev.SOL if disable_astra == '1' else ASTRA)
+
     def test_ladder_receives_bounded_failure_reason_instead_of_frontier_escalation(self):
         for models, expected in ((NATIVE_MODELS, SOL61), (REQUIRED_NATIVE_MODELS, "gpt-6-sol")):
             config = {"providers": [{"id": "gateway", "models": {m: "gateway/" + m for m in models}}]}
