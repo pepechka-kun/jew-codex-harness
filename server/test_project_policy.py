@@ -26,7 +26,7 @@ class ProjectPolicyTests(unittest.TestCase):
         policies = ({"native_only": True}, {"no_paid_fallback": True},
                     {"allowed_providers": ["free"]}, {"require_astra_final": True}, None)
         for policy in policies:
-            for failure in ("healthy", "quota", "already_dry"):
+            for failure in ("healthy", "quota", "already_dry", "off_and_shadow"):
                 with self.subTest(policy=policy, failure=failure), tempfile.TemporaryDirectory() as root, ExitStack() as stack:
                     payload = {"model": "jev/auto", "input": "synthetic task", "prompt_cache_key": "session"}
                     if policy and policy.get("require_astra_final"):
@@ -40,6 +40,8 @@ class ProjectPolicyTests(unittest.TestCase):
                     for name in ("OFF_PATH", "SHADOW_PATH", "DEBUG_PATH", "DRY_STATE_PATH", "SIGNATURE_PATH"):
                         stack.enter_context(mock.patch.object(jev, name, str(Path(root) / name)))
                     Path(jev.OFF_PATH).touch()
+                    if failure == "off_and_shadow":
+                        Path(jev.SHADOW_PATH).touch()
                     stack.enter_context(mock.patch.object(jev, "STATE", root))
                     stack.enter_context(mock.patch.dict(jev.os.environ, {"JEV_LADDER_MODE": "active", "JEV_DISABLE_AUTO_ASTRA": "1"}))
                     stack.enter_context(mock.patch.object(jev, "_provider_ladder", return_value=ladder))

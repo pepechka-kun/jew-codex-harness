@@ -2364,7 +2364,7 @@ class Handler(BaseHTTPRequestHandler):
                                       decision_source, routing_gate=gate)
 
         would = None
-        if shadow_enabled:
+        if shadow_enabled and not routing_off:
             would = {"model": model, "effort": effort, "speed": speed, "gate": gate}
             model, effort, speed, gate = (SOL if os.environ.get("JEV_DISABLE_AUTO_ASTRA") == "1" else ASTRA), None, "default", "shadow(base)"
 
