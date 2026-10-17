@@ -108,7 +108,7 @@ class OptionalModelRouting(unittest.TestCase):
             self.assertEqual(handler._json.call_args.args[0], 503)
             self.assertEqual(handler._json.call_args.args[1]['error']['code'], 'model_cooldown')
 
-    def test_kill_switch_bypasses_unhealthy_or_unreadable_provider_ladders(self):
+    def test_kill_switch_bypasses_unhealthy_or_unreadable_provider_state(self):
         for unavailable in ('cooldown', 'state_error'):
             for disable_astra in ('0', '1'):
                 with self.subTest(unavailable=unavailable, disable_astra=disable_astra), \
@@ -124,9 +124,10 @@ class OptionalModelRouting(unittest.TestCase):
                     ladder.advance('prior', ladder.route('prior', SOL61, 'medium'),
                                    'model_unavailable', cooldown_seconds=300)
                     self.assertEqual(ladder.model_candidates(), ())
-                    loader = stack.enter_context(mock.patch.object(jev, '_provider_ladder',
-                        side_effect=ValueError('unavailable state') if unavailable == 'state_error' else None,
-                        return_value=ladder))
+                    if unavailable == 'state_error':
+                        ladder.path.write_text('invalid state')
+                    loader = stack.enter_context(mock.patch.object(jev, '_provider_ladder', return_value=ladder))
+                    stack.enter_context(mock.patch.object(ladder, 'model_candidates', side_effect=AssertionError('off must not read health state')))
                     classifier = stack.enter_context(mock.patch.object(jev, 'call_jev_routed'))
                     for name in ('log_line', 'remember_cache_model', 'remember_route_lease', 'route_lease', 'native_dry'):
                         stack.enter_context(mock.patch.object(jev, name, return_value=None))
@@ -139,7 +140,7 @@ class OptionalModelRouting(unittest.TestCase):
                     handler._serve_ladder = mock.Mock()
                     handler._forward = mock.Mock(return_value=(200, 'json', 'application/json', False, None, None))
                     handler._post()
-                    loader.assert_not_called()
+                    loader.assert_called_once()
                     classifier.assert_not_called()
                     handler._json.assert_not_called()
                     handler._serve_ladder.assert_not_called()

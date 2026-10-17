@@ -164,8 +164,9 @@ def main():
             routes[k] = {"tier": decision["model"], "conf": decision["confidence"],
                          "depth": decision["effort"], "route": decision["model"]}
         except Exception as e:
-            routes[k] = {"tier": None, "conf": None, "depth": None, "route": "gpt-6-astra"}
-            print(f"  #{i}: Jev error → astra ({e})")
+            fallback = jev.workhorse(jev.automatic_models(jev.TIERS))
+            routes[k] = {"tier": fallback, "conf": None, "depth": "medium", "route": fallback}
+            print(f"  #{i}: Jev error → {fallback} ({type(e).__name__})")
         if i % 25 == 0:
             print(f"  ...{i}/{len(keys)} ({time.time()-t0:.0f}s)")
     print(f"Jev classification: {len(keys)} prompts in {time.time()-t0:.0f}s")
@@ -184,7 +185,7 @@ def main():
             if r_info is None:
                 skipped += 1
                 continue
-            r = ("gpt-6-astra" if r_info.get("tier") is None
+            r = (jev.workhorse(jev.automatic_models(jev.TIERS)) if r_info.get("tier") is None
                  else route_policy(r_info["tier"], r_info.get("depth"), r_info.get("conf")))
             cj = cost(r, tok)
         except KeyError:

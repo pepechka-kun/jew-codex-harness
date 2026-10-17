@@ -179,6 +179,10 @@ recognition by Jev is not deterministic proof that every final review was
 detected; explicit phase metadata is the deterministic trigger. Off/shadow
 flags cannot bypass configured project restrictions. These policies apply to
 `jev/auto`, not manually selected models in the parent client.
+Off still validates the operator configuration, but bypasses provider health
+and sticky state. With project policies configured it uses only a permitted,
+configured native route and never discovers external fallback routes; it fails
+closed when no such route is available.
 ## Request budgets
 
 Optional `request_budget` (version 2 and legacy) sets `connect_seconds` (15),

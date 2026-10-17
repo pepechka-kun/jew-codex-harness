@@ -2242,10 +2242,14 @@ class Handler(BaseHTTPRequestHandler):
         self._policy_ladder = None
         routing_off = os.path.exists(OFF_PATH)
         shadow_enabled = os.path.exists(SHADOW_PATH)
-        if os.environ.get("JEV_LADDER_MODE") == "active" and not routing_off:
+        if os.environ.get("JEV_LADDER_MODE") == "active":
             try:
                 self._policy_ladder = _provider_ladder()
                 self._project_policy = resolve_project_policy(self._policy_ladder.config, scope)
+                if self._project_policy:
+                    self._policy_ladder = Ladder(restrict_project_routes(
+                        self._policy_ladder.config, self._project_policy,
+                        final_required(self._project_policy, payload, None)), self._policy_ladder.path)
             except (OSError, ValueError, RuntimeError):
                 return self._json(503, {"error": {"message": "provider policy unavailable"}})
         affinity = cache_affinity(scope, payload)
@@ -2259,7 +2263,7 @@ class Handler(BaseHTTPRequestHandler):
         shadow_routes_native = shadow_enabled and not self._project_policy and fixed_model is None
         try:
             candidates = (self._policy_ladder.model_candidates()
-                          if self._policy_ladder and fixed_model is None and not shadow_routes_native else available_models)
+                          if self._policy_ladder and fixed_model is None and not routing_off and not shadow_routes_native else available_models)
         except (OSError, ValueError, RuntimeError):
             return self._json(503, {"error": {"message": "provider model health unavailable"}})
         models = automatic_models(candidates)
@@ -2269,7 +2273,8 @@ class Handler(BaseHTTPRequestHandler):
         questions = questions_for_models(models)
         if leased and leased["model"] not in models:
             leased = None
-        if self._project_policy and self._project_policy.get("native_only"):
+        if self._project_policy and (self._project_policy.get("native_only")
+                                    or (routing_off and final_required(self._project_policy, payload, None))):
             model, effort, speed, gate = ASTRA, "medium", "default", "project_native_only"
             decision_source = "project_policy"
         elif fixed_model is not None:
@@ -2336,6 +2341,20 @@ class Handler(BaseHTTPRequestHandler):
                 effort, speed, gate = "medium", "default", "no_key_or_task"
                 decision_source = "technical_fallback"
 
+        if routing_off and self._project_policy:
+            # Off bypasses the ladder's health and sticky state, not operator
+            # restrictions. Use an explicitly configured permitted native route.
+            try:
+                native = Ladder(restrict_project_routes(self._policy_ladder.config,
+                    {**self._project_policy, "native_only": True},
+                    final_required(self._project_policy, payload, decision)), self._policy_ladder.path)
+                chosen = native.native_route(model, effort)
+                if chosen is None:
+                    raise ValueError("No permitted native route")
+                model = chosen["model"]
+            except (OSError, ValueError, RuntimeError):
+                return self._json(503, {"error": {"message": "No configured native route satisfies project policy"}})
+
         if (not routing_off and os.environ.get("JEV_LADDER_MODE") == "active"
                 and (self._project_policy or fixed_model is not None or (not shadow_enabled
                 and isinstance(payload.get("prompt_cache_key"), str)
@@ -2358,7 +2377,7 @@ class Handler(BaseHTTPRequestHandler):
         fallback_plan = []
         no_fallback = False
         if dry_reason and model in TIERS:
-            fallback_plan = fallback_candidates(native_model, payload)
+            fallback_plan = fallback_candidates(native_model, payload) if not self._project_policy else []
             if fallback_plan:
                 model = fallback_plan.pop(0)
                 effort = tandem_effort(effort, native_model)
@@ -2411,7 +2430,7 @@ class Handler(BaseHTTPRequestHandler):
             # retry this exact canonical call before anything reaches the client.
             mark_native_dry("quota", resets_at=resets_at)
             dry_reason = "quota"
-            fallback_plan = fallback_candidates(native_model, payload)
+            fallback_plan = fallback_candidates(native_model, payload) if not self._project_policy else []
             if fallback_plan:
                 model = fallback_plan.pop(0)
                 effort = tandem_effort(effort, native_model)

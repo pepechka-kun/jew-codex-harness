@@ -18,6 +18,37 @@ spec.loader.exec_module(backtest)
 
 
 class ReplayPolicy(unittest.TestCase):
+    def test_classifier_errors_use_the_same_bounded_workhorse_as_production(self):
+        for response in (TimeoutError("synthetic private provider detail"), {"answers": {}}):
+            with self.subTest(response=type(response).__name__), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.write_session(root, "supported", routing_policy.ASTRA, 1_000_000)
+                result = root / "result.json"
+                output = io.StringIO()
+                with mock.patch.object(backtest, "SESS_ROOT", str(root)), \
+                     mock.patch.object(backtest, "RESULT_PATH", str(result)), \
+                     mock.patch.object(backtest.poc, "load_key", return_value="synthetic"), \
+                     mock.patch.object(backtest.poc, "post_json", **({"side_effect": response} if isinstance(response, Exception) else {"return_value": response})), \
+                     mock.patch("sys.argv", ["backtest"]), contextlib.redirect_stdout(output):
+                    self.assertEqual(backtest.main(), 0)
+                data = json.loads(result.read_text())
+                expected = routing_policy.workhorse(routing_policy.automatic_models(routing_policy.TIERS))
+                self.assertEqual(data["routes"][expected]["turns"], 1)
+                self.assertEqual(data["routes"][routing_policy.ASTRA]["turns"], 0)
+                self.assertEqual(data["jev_usd"], backtest.cost(expected, {"input_tokens": 1_000_000}))
+                self.assertNotIn("synthetic private provider detail", output.getvalue())
+                # Cached failed decisions from earlier runs have no tier. They
+                # must project through the same current fallback without calls.
+                for route in data["routes_detail"].values():
+                    route.update(tier=None, route=routing_policy.ASTRA)
+                result.write_text(json.dumps(data))
+                with mock.patch.object(backtest, "SESS_ROOT", str(root)), \
+                     mock.patch.object(backtest, "RESULT_PATH", str(result)), \
+                     mock.patch.object(backtest.poc, "post_json") as provider, \
+                     mock.patch("sys.argv", ["backtest", "--from-cache"]), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(backtest.main(), 0)
+                provider.assert_not_called()
+                self.assertEqual(json.loads(result.read_text())["jev_usd"], data["jev_usd"])
     def write_session(self, root, name, model, volume):
         folder = root / "2026/09/20"
         folder.mkdir(parents=True, exist_ok=True)
