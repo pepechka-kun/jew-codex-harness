@@ -1,5 +1,7 @@
 """Optional model tiers and exact routing choices."""
 import copy
+from contextlib import ExitStack
+import io
 import json
 import os
 from pathlib import Path
@@ -105,6 +107,44 @@ class OptionalModelRouting(unittest.TestCase):
             handler._serve_ladder.assert_not_called()
             self.assertEqual(handler._json.call_args.args[0], 503)
             self.assertEqual(handler._json.call_args.args[1]['error']['code'], 'model_cooldown')
+
+    def test_kill_switch_bypasses_unhealthy_or_unreadable_provider_ladders(self):
+        for unavailable in ('cooldown', 'state_error'):
+            for disable_astra in ('0', '1'):
+                with self.subTest(unavailable=unavailable, disable_astra=disable_astra), \
+                     tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                    for name in ('OFF_PATH', 'SHADOW_PATH', 'DEBUG_PATH', 'DRY_STATE_PATH', 'SIGNATURE_PATH'):
+                        stack.enter_context(mock.patch.object(jev, name, str(Path(directory) / name)))
+                    Path(jev.OFF_PATH).touch()
+                    stack.enter_context(mock.patch.object(jev, 'STATE', directory))
+                    stack.enter_context(mock.patch.dict(os.environ, {'JEV_LADDER_MODE': 'active',
+                                         'JEV_DISABLE_AUTO_ASTRA': disable_astra}))
+                    ladder = Ladder({'providers': [{'id': 'primary', 'model': 'gateway/fixed'}]},
+                                    Path(directory) / 'state.json')
+                    ladder.advance('prior', ladder.route('prior', SOL61, 'medium'),
+                                   'model_unavailable', cooldown_seconds=300)
+                    self.assertEqual(ladder.model_candidates(), ())
+                    loader = stack.enter_context(mock.patch.object(jev, '_provider_ladder',
+                        side_effect=ValueError('unavailable state') if unavailable == 'state_error' else None,
+                        return_value=ladder))
+                    classifier = stack.enter_context(mock.patch.object(jev, 'call_jev_routed'))
+                    for name in ('log_line', 'remember_cache_model', 'remember_route_lease', 'route_lease', 'native_dry'):
+                        stack.enter_context(mock.patch.object(jev, name, return_value=None))
+                    stack.enter_context(mock.patch.object(jev, 'load_key', side_effect=AssertionError('Jev must stay off')))
+                    handler = object.__new__(jev.Handler)
+                    handler.path = '/v1/responses'
+                    handler._body = lambda _: {'model': 'jev/auto', 'input': 'synthetic',
+                                               'prompt_cache_key': 'synthetic-scope'}
+                    handler._json = mock.Mock()
+                    handler._serve_ladder = mock.Mock()
+                    handler._forward = mock.Mock(return_value=(200, 'json', 'application/json', False, None, None))
+                    handler._post()
+                    loader.assert_not_called()
+                    classifier.assert_not_called()
+                    handler._json.assert_not_called()
+                    handler._serve_ladder.assert_not_called()
+                    expected = jev.SOL if disable_astra == '1' else ASTRA
+                    self.assertEqual(handler._forward.call_args.args[0]['model'], expected)
 
     def test_classifier_failure_never_escalates_to_the_only_healthy_frontier_model(self):
         for key in (None, 'fixture'):

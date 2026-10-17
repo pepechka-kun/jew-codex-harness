@@ -2240,7 +2240,8 @@ class Handler(BaseHTTPRequestHandler):
         scope = cache_scope(payload, task)
         self._project_policy = None
         self._policy_ladder = None
-        if os.environ.get("JEV_LADDER_MODE") == "active":
+        routing_off = os.path.exists(OFF_PATH)
+        if os.environ.get("JEV_LADDER_MODE") == "active" and not routing_off:
             try:
                 self._policy_ladder = _provider_ladder()
                 self._project_policy = resolve_project_policy(self._policy_ladder.config, scope)
@@ -2277,7 +2278,7 @@ class Handler(BaseHTTPRequestHandler):
             if effort not in EFFORTS:
                 return self._json(400, {"error": {"message": "Unsupported reasoning effort for fixed model"}})
             model, speed, gate, decision_source = fixed_model, "default", "manual", "manual"
-        elif os.path.exists(OFF_PATH):
+        elif routing_off:
             model, effort, speed, gate = (SOL if os.environ.get("JEV_DISABLE_AUTO_ASTRA") == "1" else ASTRA), None, "default", "off"
         else:
             key = load_key()
@@ -2333,7 +2334,7 @@ class Handler(BaseHTTPRequestHandler):
                 effort, speed, gate = "medium", "default", "no_key_or_task"
                 decision_source = "technical_fallback"
 
-        if (os.environ.get("JEV_LADDER_MODE") == "active"
+        if (not routing_off and os.environ.get("JEV_LADDER_MODE") == "active"
                 and (self._project_policy or fixed_model is not None or (not os.path.exists(OFF_PATH) and not os.path.exists(SHADOW_PATH)
                 and isinstance(payload.get("prompt_cache_key"), str)
                 and payload["prompt_cache_key"].strip()))):
