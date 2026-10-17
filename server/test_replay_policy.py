@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -74,11 +75,12 @@ class ReplayPolicy(unittest.TestCase):
             result = root / "result.json"
             pair = routing_policy.route_choice(routing_policy.SOL61, "medium")
             answers = {key: {"choice": value, "confidence": 0.95} for key, value in pair.items()}
+            output = io.StringIO()
             with mock.patch.object(backtest, "SESS_ROOT", str(root)), \
                  mock.patch.object(backtest, "RESULT_PATH", str(result)), \
                  mock.patch.object(backtest.poc, "load_key", return_value="fixture"), \
                  mock.patch.object(backtest.poc, "post_json", return_value={"answers": answers}), \
-                 mock.patch("sys.argv", ["backtest"]), contextlib.redirect_stdout(io.StringIO()):
+                 mock.patch("sys.argv", ["backtest"]), contextlib.redirect_stdout(output):
                 self.assertEqual(backtest.main(), 0)
             data = json.loads(result.read_text())
             self.assertEqual(data["turns"], 2)
@@ -88,6 +90,9 @@ class ReplayPolicy(unittest.TestCase):
             self.assertEqual(data["jev_usd"], 4.0)
             self.assertEqual(data["routes"][routing_policy.SOL61]["turns"], 2)
             self.assertEqual(data["scenarios_usd"][routing_policy.SOL61], 4.0)
+            breakdown = {model: int(count) for model, count in
+                         re.findall(r"^  (\S+)\s+(\d+) turns", output.getvalue(), re.M)}
+            self.assertEqual(breakdown, {routing_policy.SOL61: 2})
 
     def test_identical_short_replies_do_not_share_different_contexts(self):
         self.assertNotEqual(backtest.turn_key({"text": "continue", "prev": "first task"}),

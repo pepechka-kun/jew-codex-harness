@@ -2705,6 +2705,7 @@ class Handler(BaseHTTPRequestHandler):
                 log_line({"at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                           "policy_version": POLICY_VERSION, "ladder_stage": "stream_incomplete",
                           "failed_stage": chosen["stage"], "model": model,
+                          "decision_source": decision_source,
                           **getattr(self, "_jev_timing", {}), **getattr(self, "_jev_error", {}),
                           "attempts": self._attempts, "status": status,
                           "cache_scope": scope, "stream": stream_requested})

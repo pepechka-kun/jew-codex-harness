@@ -1,6 +1,7 @@
 """A provider quota refusal retries the same canonical turn before any output."""
 import io
 import json
+from itertools import product
 import tempfile
 from pathlib import Path
 import unittest
@@ -19,8 +20,8 @@ class LadderForwardTests(unittest.TestCase):
     def test_jev_failure_diagnostics_survive_ladder_outcomes(self):
         details = {"jev_error_stage": "decision_validation", "jev_error_reason": "missing_decision",
                    "jev_error_field": "model"}
-        for outcome in ("completed", "stream_incomplete", "failed"):
-            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+        for outcome, source in product(("completed", "stream_incomplete", "failed"), ("technical_fallback", "manual")):
+            with self.subTest(outcome=outcome, source=source), tempfile.TemporaryDirectory() as directory:
                 ladder = Ladder(CONFIG, Path(directory) / "state.json")
                 handler = self.handler()
                 handler._jev_error = details
@@ -36,10 +37,11 @@ class LadderForwardTests(unittest.TestCase):
                      mock.patch.object(jev, "log_line") as logged:
                     handler._serve_ladder({"model":"jev/auto", "input":"fixture"}, "scope", jev.LUNA,
                         "low", None, {"step_type":"user_turn"}, None, True, False,
-                        decision_source="technical_fallback", routing_gate="jev_error:ValueError")
+                        decision_source=source, routing_gate="jev_error:ValueError")
                 row = logged.call_args.args[0]
                 self.assertEqual({k:v for k,v in row.items() if k.startswith("jev_error_")}, details)
                 self.assertEqual(row["jev_timing"], handler._jev_timing["jev_timing"])
+                self.assertEqual(row["decision_source"], source)
                 self.assertEqual(row["ladder_stage"], "plus" if outcome == "completed" else outcome)
 
     def test_wire_summary_contains_only_event_types(self):

@@ -235,7 +235,7 @@ def main():
         f"{k.split('/')[-1]} ${v:.0f}" for k, v in sorted(scen.items(), key=lambda x: x[1])))
     print(f"full-Astra baseline: ${astra_all:.0f} (fixed token volume; not measured quota)")
     print("-" * 72)
-    for k in ("gpt-6-luna", "gpt-6-sol", "gpt-6-astra"):
+    for k in sorted(dist_counts):
         print(f"  {k:<14} {dist_counts.get(k,0):>4} turns · ${dist_costs.get(k,0):.2f}")
     print(f"result: {RESULT_PATH}")
     return 0
