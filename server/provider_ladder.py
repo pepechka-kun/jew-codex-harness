@@ -12,15 +12,18 @@ try:
     from .reasoning_effort import validate_reasoning_profiles
     from .project_policy import validate_project_fields
     from .request_budget import validate_budget
+    from .routing_policy import TIERS
 except ImportError:  # launched as a script from server/
     from portable_lock import locked_file
     from reasoning_effort import validate_reasoning_profiles
     from project_policy import validate_project_fields
     from request_budget import validate_budget
+    from routing_policy import TIERS
 
 STAGES = ("plus", "gemini", "opus", "glm", "deepseek", "wally", "main", "exhausted")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
-NATIVE_MODELS = ("gpt-6-luna", "gpt-5.6-terra", "gpt-6-sol", "gpt-6-astra")
+REQUIRED_NATIVE_MODELS = ("gpt-6-luna", "gpt-5.6-terra", "gpt-6-sol", "gpt-6-astra")
+NATIVE_MODELS = TIERS
 
 
 def validate_ordered_config(value):
@@ -54,9 +57,9 @@ def validate_ordered_config(value):
         if "model" in provider and (not isinstance(model, str) or not model.strip() or model != model.strip()):
             raise ValueError("Provider model must be an exact non-empty model ID")
         if "models" in provider:
-            if (not isinstance(models, dict) or set(models) != set(NATIVE_MODELS)
+            if (not isinstance(models, dict) or not set(REQUIRED_NATIVE_MODELS) <= set(models) <= set(NATIVE_MODELS)
                     or any(not isinstance(m, str) or not m.strip() or m != m.strip() for m in models.values())):
-                raise ValueError("Provider models must map every Jev native model to an exact model ID")
+                raise ValueError("Provider models must include all required native models and only known optional models")
         if model is None and models is None and transport != "native":
             raise ValueError("OmniRoute provider needs model or models")
         accounts = provider.get("connection_ids", [])
@@ -120,7 +123,7 @@ def validate_config(value):
 
 
 def plus_model(tier, effort):
-    if tier not in NATIVE_MODELS or effort not in EFFORTS:
+    if tier not in REQUIRED_NATIVE_MODELS or effort not in EFFORTS:
         raise ValueError("Invalid Plus model or reasoning effort")
     if tier == "gpt-6-astra":
         return tier
@@ -137,6 +140,18 @@ class Ladder:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.lock = self.path.with_suffix(".lock")
 
+    def available_models(self):
+        """Optional tiers require a mapping on every mapped fallback provider.
+
+        Fixed routes explicitly replace any selected tier; unmapped native
+        routes preserve it. Legacy sequences keep their original model set.
+        """
+        if self.providers is None:
+            return REQUIRED_NATIVE_MODELS
+        return tuple(model for model in NATIVE_MODELS if all(
+            "models" not in provider or model in provider["models"]
+            for provider in self.providers))
+
     def _load(self):
         try:
             value = json.loads(self.path.read_text())
@@ -145,6 +160,23 @@ class Ladder:
         if not isinstance(value, dict):
             raise ValueError("provider ladder state is not an object")
         return value
+
+    def model_candidates(self):
+        """Do not offer a destination known to be unavailable on every route."""
+        models = self.available_models()
+        if self.providers is None:
+            return models
+        def operation(state):
+            entries = self._cooldowns(state)
+            now = time.time()
+            candidates = tuple(model for model in models if any(
+                max(entries.get(self._cooldown_key(
+                    self._ordered_choice(index, account, model, "medium"), reason),
+                    {}).get("until", 0) for reason in ("model_unavailable", "model_account_unavailable")) <= now
+                for index, provider in enumerate(self.providers)
+                for account in range(max(1, len(provider.get("connection_ids", []))))))
+            return candidates, False
+        return self._with_state(operation)
 
     def _save(self, value):
         tmp = self.path.with_name(self.path.name + ".tmp-" + str(os.getpid()))
@@ -224,7 +256,7 @@ class Ladder:
 
     def advance(self, scope, route, reason, reset_at=None, cooldown_seconds=900):
         """CAS: only the failed route may advance its own thread."""
-        if reason not in ("quota", "unavailable", "invalid_response", "auth", "model_unavailable", "rate_limit", "timeout"):
+        if reason not in ("quota", "unavailable", "invalid_response", "auth", "model_unavailable", "model_account_unavailable", "rate_limit", "timeout"):
             raise ValueError("unsupported fallback reason")
         if self.providers is not None:
             return self._ordered_advance(scope, route, reason, reset_at, cooldown_seconds)
@@ -331,6 +363,8 @@ class Ladder:
         # isolate an account across models; model failures isolate a destination.
         identity = ([route.get("transport"), route.get("stage"), route.get("model")]
                     if reason == "model_unavailable" else
+                    ["model_account", route.get("transport"), route.get("stage"), route.get("model"), route.get("account")]
+                    if reason == "model_account_unavailable" else
                     [route.get("transport"), route.get("account")] if route.get("account") else
                     [route.get("transport"), route.get("stage"), route.get("model"), None])
         return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
@@ -350,11 +384,11 @@ class Ladder:
 
     def _slot_until(self, entries, route):
         return max((entries.get(self._cooldown_key(route, reason), {}).get("until", 0)
-                    for reason in (None, "model_unavailable")), default=0)
+                    for reason in (None, "model_unavailable", "model_account_unavailable")), default=0)
 
     def _ordered_route(self, scope, tier, effort, recover_primary):
-        if tier not in NATIVE_MODELS or effort not in EFFORTS:
-            raise ValueError("Invalid Jev model or reasoning effort")
+        if tier not in self.available_models() or effort not in EFFORTS:
+            raise ValueError("Invalid or unconfigured Jev model or reasoning effort")
         def operation(state):
             thread = state.get(scope)
             if not isinstance(thread, dict) or thread.get("config_hash") != self.fingerprint:
@@ -377,6 +411,12 @@ class Ladder:
             until = circuit.get("until", 0) if circuit.get("config_hash") == self.fingerprint else 0
             if type(until) not in (int, float) or not math.isfinite(until):
                 raise ValueError("Invalid ordered provider cooldown")
+            if ("model" in circuit
+                    and circuit["model"] != self._ordered_choice(0, 0, tier, effort)["model"]):
+                # A rejected destination must not disable the provider's other models.
+                until = 0
+                if thread.get("last_failure") in ("model_unavailable", "model_account_unavailable"):
+                    retry_at = 0
             if recover_primary and index > 0 and retry_at is not None and now >= retry_at and now >= until:
                 thread["resume_route"] = (index, account)
                 index = account = 0
@@ -438,7 +478,9 @@ class Ladder:
                     until = min(self._slot_until(entries, self._ordered_choice(0, slot,
                                        route["selected_tier"], route["effort"]))
                                 for slot in range(max(1, len(accounts))))
-                    state["_ordered_primary_circuit"] = {"config_hash": self.fingerprint, "until": until}
+                    state["_ordered_primary_circuit"] = {
+                        "config_hash": self.fingerprint, "until": until,
+                        **({"model": route["model"]} if reason in ("model_unavailable", "model_account_unavailable") else {})}
                     thread["primary_retry_at"] = until
                     index, account = thread.pop("resume_route", (1, 0))
                     if index >= len(self.providers):

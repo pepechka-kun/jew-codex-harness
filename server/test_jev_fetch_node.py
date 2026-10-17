@@ -32,6 +32,43 @@ class JevFetchNodeTests(unittest.TestCase):
         return subprocess.run([NODE, "--input-type=module", "-e", MOCK_FETCH, str(HELPER)],
                               input=json.dumps(payload), capture_output=True, text=True, check=False)
 
+    def test_failures_emit_only_stage_reason_and_optional_status(self):
+        cases = [
+            ("throw new Error('synthetic-private')", "transport", "connection_failed", None),
+            ("throw Object.assign(new Error('synthetic-private'), {name:'TimeoutError'})", "transport", "timeout", None),
+            ("return {ok:false,status:503,text:()=>{throw Error('synthetic-private')}}", "transport", "http_error", 503),
+            ("return {ok:true,json:async()=>{throw SyntaxError('synthetic-private')}}", "response_parse", "invalid_json", None),
+            ("return {ok:true,json:async()=>{throw Error('synthetic-private')}}", "transport", "connection_failed", None),
+            ("return {ok:true,json:async()=>[]}", "response_validation", "invalid_response_type", None),
+            ("return {ok:true,json:async()=>({answers:[],body:'synthetic-private'})}", "response_validation", "missing_answers", None),
+        ]
+        for body, stage, reason, status in cases:
+            script = ("import {pathToFileURL} from 'node:url'; globalThis.fetch=async()=>{"
+                      + body + "}; await import(pathToFileURL(process.argv[1]).href);")
+            with self.subTest(reason=reason):
+                result = subprocess.run([NODE, "--input-type=module", "-e", script, str(HELPER), "--timings"],
+                    input=json.dumps({"key":"synthetic-private", "body":{"state":"synthetic-private"}}),
+                    capture_output=True, text=True, check=False, timeout=10)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                expected = {"stage":stage,"reason":reason}
+                if status:
+                    expected["http_status"] = status
+                lines = [json.loads(line) for line in result.stderr.splitlines()]
+                self.assertEqual(lines[-1], expected)
+                self.assertTrue(all(set(line) == {"jev_timing"} for line in lines[:-1]))
+                self.assertNotIn("synthetic-private", result.stderr)
+
+    def test_older_callers_keep_the_single_line_error_protocol(self):
+        script = ("import {pathToFileURL} from 'node:url'; globalThis.fetch=async()=>{"
+                  "throw Error('synthetic-private')}; await import(pathToFileURL(process.argv[1]).href);")
+        result = subprocess.run([NODE, "--input-type=module", "-e", script, str(HELPER)],
+            input=json.dumps({"key":"synthetic-private", "body":{}}),
+            capture_output=True, text=True, check=False, timeout=10)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stderr), {"stage":"transport", "reason":"connection_failed"})
+        self.assertNotIn('synthetic-private', result.stderr)
+
     def test_openrouter_uses_decisions_api(self):
         result = self.call("openrouter")
         self.assertEqual(result.returncode, 0)

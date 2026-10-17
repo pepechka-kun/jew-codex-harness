@@ -22,7 +22,8 @@ identifiers; they are labels, not predefined provider names. Each entry has:
 - `transport`: `omniroute` (default) or `native` (the bundled Codex router).
 - `model`: one exact destination ID for every Jev decision; or `models`: a
   complete mapping from `gpt-6-luna`, `gpt-5.6-terra`, `gpt-6-sol` and
-  `gpt-6-astra` to exact destination IDs. Do not supply both fields.
+  `gpt-6-astra` to exact destination IDs. It may additionally map `gpt-6.1-sol`;
+  existing four-model mappings remain valid. Do not supply both fields.
 - `connection_ids`: optional ordered list of 1-32 unique OmniRoute account IDs.
   Omitting it lets the existing gateway choose the connection. Native routes
   cannot specify external account IDs.
@@ -39,6 +40,62 @@ as unknown, not inferred from a provider name. An empty profile object is valid.
 Mixed legacy/v2 fields, duplicate IDs, partial model mappings and invalid
 reasoning profiles are rejected before installation.
 
+## Optional model tiers
+
+When GPT-6.1 Sol is available across the provider sequence, automatic routing
+offers it instead of GPT-6 Sol. Manual model IDs and legacy mappings remain valid. Add
+`"gpt-6.1-sol": "codex/gpt-6.1-sol"` to each mapped provider that has verified
+this exact destination. A choice is offered only when every mapped fallback
+provider includes it; fixed routes still replace any choice explicitly, and
+unmapped native routes preserve it. Legacy sequences keep their original four
+choices. The wizard retains its four required destinations; optional mappings
+can be added to the protected provider file before installation or reconfiguration.
+
+For external Responses requests the gateway owns its provider client identity.
+The harness neither forwards caller `Version` / `User-Agent` headers nor detects
+a local CLI version to inject into the gateway request. Otherwise an older caller
+or a different CLI installed for the service could override the gateway's current
+identity and make available models appear unsupported. Maintain that identity in
+the gateway itself (for example OmniRoute's `CODEX_CLIENT_VERSION` setting).
+Native routes continue to use the native client's own protocol identity.
+The verified GPT-6.1 Sol reasoning levels are low, medium, high, xhigh and max:
+[official model documentation](https://developers.openai.com/api/docs/models/gpt-6.1-sol).
+Gateway adapters can narrow that range; declare their observed limits in
+`reasoning_profiles` rather than assuming the entire published range works on
+every path. Its API rate is included in reports; native credit rates remain unknown until
+independently verified. Routine commands and orchestration bookkeeping can use Luna
+with low effort. A confidence score alone never upgrades a valid small-model decision.
+A technical decision failure falls back to Sol 6.1 (or Sol 6 on legacy-only routes),
+medium effort; the exception type is recorded without private error text. On failure,
+`jev_error_stage` and `jev_error_reason` identify the transport, response parsing,
+response validation, decision validation, or route application phase. Known
+validation failures also record `jev_error_field` (one of the four question
+names); HTTP refusals record a numeric `jev_error_http_status`. These enum-only
+fields are available in `explain` and in both native and provider-ladder logs,
+including failed fallback attempts. Unknown exceptions use `unexpected_error`.
+Exception messages, tracebacks, provider bodies, keys and prompt text are never
+copied into these diagnostics. The legacy `jev_error:<type>` gate format and
+bounded fallback policy remain unchanged. Existing type-only log entries cannot be reconstructed.
+
+`jev_timing` records the last observed phase and bounded numeric milliseconds on
+fresh decisions, including outer helper timeouts. `elapsed_ms` covers the parent
+call; `budget_ms` is its unchanged deadline. Node emits progress snapshots while
+running: `startup_ms` estimates parent invocation to helper entry using the local
+wall clock; the `*_at_ms` milestones and `helper_elapsed_ms` use a monotonic clock
+relative to helper entry. Subtract `connect_started_at_ms` from `connected_at_ms`
+for connection setup (DNS/TCP/TLS together), `connected_at_ms` from `headers_at_ms`
+for waiting on response headers, and `headers_at_ms` from `body_done_at_ms` for
+body transfer. Header wait includes network and provider processing; it is not
+pure model reasoning time. Missing milestones remain absent. An outer timeout
+before any snapshot is `helper_start` with `observed=false`, rather than a claim
+that the provider was slow. The Python fallback reports its coarser `python_open`
+or body/parse phase without claiming DNS/TCP/TLS detail. `explain` applies the
+same enum/numeric allowlist; no timing is carried into lease hits or manual routes.
+Progress contains no prompt, credential, URL, provider body or exception text.
+The parent opts into progress snapshots with `--timings`; older callers retain
+the single-line error protocol during source updates.
+Mandatory Astra architecture and final/risk reviews stay intact.
+
 ## Fallback and recovery
 
 Failures before output exposure try account IDs, then providers, in the supplied
@@ -47,7 +104,7 @@ requests and server restarts. No attempt can advance a newer route with a stale
 failure receipt. Exhausting the primary opens a shared cooldown; parked threads
 probe it again after the reset time, retaining their previous fallback if the
 probe fails. Without a usable reset header, cooldowns are bounded: normally 30
-seconds, 300 for quota failures, and 900 for HTTP 400/401/403.
+seconds, 300 for quota/model failures, and 900 for HTTP 401/403.
 Recovery probes happen only at the start of a new request; slow fallbacks cannot
 restart the sequence partway through the same request.
 
@@ -172,3 +229,52 @@ account and unrelated routes remain usable. Complete exhaustion can recover a
 secondary route before a longer primary auth cooldown. Legacy configs retain
 their historical sticky/shared-primary state and request-shape 400 handoffs; convert using `routes apply` for
 full per-account cooldowns. No upstream error body enters routing telemetry.
+
+An explicit model-unavailable error code or the Codex account's explicit
+model-not-supported refusal is a model failure even when delivered as HTTP 400
+or 422. A generic HTTP 400 remains a bad payload and is not retried. Known model
+refusals record `provider_error_stage: upstream_response` and the constant
+`provider_error_reason` (`model_unavailable` or `model_not_supported_for_account`)
+in the attempt and in `explain`, separately from failures of Jev's classifier.
+If no configured fallback succeeds, the client receives a short safe explanation
+with the same error code. Provider bodies are not copied into these diagnostics.
+An account-specific refusal cools only that account/model pair; other configured
+accounts can still serve the same destination.
+The five-minute model cooldown does not disable other destinations on that
+provider, and expiration allows a new request to probe the rejected model again.
+Automatic decisions stop offering a tier during that cooldown when no configured
+destination can serve it; an explicitly configured healthy fallback keeps it
+available. Manual mappings remain unchanged. If every destination is cooled,
+the request returns `model_cooldown` before another Jev classification call.
+Fallback uses only the configured sequence; it never invents a route or switches
+tiers to conceal unavailable access.
+
+
+### Fixed primary model with automatic workers
+
+A client route whose upstream model is one of the configured native model IDs
+(for example `gpt-6.1-sol`) requests that exact model and reasoning effort from
+the Jev endpoint. It skips classification and route leases, while retaining the
+provider sequence and its transport checks. Unsupported fixed models or effort
+values fail without substituting another model. Project routing policy still
+applies. The default effort for a fixed request is `medium`.
+
+Keep `jev/auto` as the worker route; its upstream model remains `auto` and each
+worker keeps its independent automatic decisions. In login-free Codex profiles,
+check the router's native alias map before selecting a native-looking model ID:
+a picker slot may refer to `jev/auto`. Declare a distinct curated fixed route
+and publish the catalog before making that route the primary session default.
+The installer continues to preserve the person's selected default model.
+
+### Reusing a model within a task
+
+Jev still chooses the model, effort and route lease. A `tool_chain` lease now
+continues across different tools and clean mixed result batches in the same
+workflow. Switching from reading to editing or verification alone does not pay
+for a new classification. For predictably uniform bounded tasks, Jev is asked
+to prefer `user_turn`; an explicit `one_call` remains one call.
+
+Reuse stays private to the session and latest user turn. Errors, unknown tool
+results, expired leases, compaction and changes to instructions or execution
+contracts invalidate the relevant lease. Provider failures clear it, and an
+unavailable model cannot be reused. No fixed-model selection is overridden.
