@@ -177,8 +177,10 @@ mandatory frontier work or the caller sets `metadata.jev_phase: "final_review"`.
 There is no cheaper fallback if that route is absent/unavailable. Semantic
 recognition by Jev is not deterministic proof that every final review was
 detected; explicit phase metadata is the deterministic trigger. Off/shadow
-flags cannot bypass configured project restrictions. These policies apply to
-`jev/auto`, not manually selected models in the parent client.
+flags cannot bypass configured project restrictions. Model-selection policies
+apply to `jev/auto`; supported fixed-model requests retain their selected model
+and effort while the policy restricts permitted transports. Unknown fixed IDs
+are rejected instead of being classified as automatic requests.
 Off still validates the operator configuration, but bypasses provider health
 and sticky state. With project policies configured it uses only a permitted,
 configured native route and never discovers external fallback routes; it fails

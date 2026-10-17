@@ -22,6 +22,46 @@ CONFIG = {"providers": [{"id": "paid", "model": "vendor/paid", "billing": "paid"
 
 
 class ProjectPolicyTests(unittest.TestCase):
+    def test_fixed_models_keep_their_identity_and_validation_under_native_only_policies(self):
+        for configured in (False, True):
+            for policy in ('native_only', 'unbound', 'explicit_final'):
+                with self.subTest(configured=configured, policy=policy), tempfile.TemporaryDirectory() as root, ExitStack() as stack:
+                    payload = {'model': jev.SOL61, 'input': 'synthetic', 'prompt_cache_key': 'session', 'reasoning': {'effort': 'high'}}
+                    if policy == 'explicit_final': payload['metadata'] = {'jev_phase': 'final_review'}
+                    scope = jev.cache_scope(payload, 'synthetic')
+                    tiers = jev.TIERS if configured else tuple(model for model in jev.TIERS if model != jev.SOL61)
+                    config = {'providers': [{'id': 'native', 'transport': 'native', 'models': {model: model for model in tiers}}],
+                        'project_policies': {'/project': {'native_only': True, 'require_astra_final': True}},
+                        'project_scopes': {scope: '/project'} if policy != 'unbound' else {}}
+                    ladder = Ladder(config, Path(root) / 'state.json')
+                    for name in ('OFF_PATH', 'SHADOW_PATH', 'DEBUG_PATH', 'DRY_STATE_PATH', 'SIGNATURE_PATH'):
+                        stack.enter_context(mock.patch.object(jev, name, str(Path(root) / name)))
+                    stack.enter_context(mock.patch.dict(jev.os.environ, {'JEV_LADDER_MODE': 'active'}))
+                    stack.enter_context(mock.patch.object(jev, '_provider_ladder', return_value=ladder))
+                    stack.enter_context(mock.patch.object(jev, 'call_jev_routed', side_effect=AssertionError('fixed models must not classify')))
+                    for name in ('route_lease', 'remember_cache_model', 'remember_route_lease'):
+                        stack.enter_context(mock.patch.object(jev, name, return_value=None))
+                    logged = stack.enter_context(mock.patch.object(jev, 'log_line'))
+                    handler = object.__new__(jev.Handler)
+                    handler.path = '/v1/responses'
+                    handler._body = lambda _: copy.deepcopy(payload)
+                    handler._json = mock.Mock()
+                    calls = []
+                    def forward(body, *args, **kwargs):
+                        calls.append(copy.deepcopy(body))
+                        handler._attempts.append({'model': body['model'], 'terminal_type': 'response.completed'})
+                        return 200, 'json', 'application/json', False, None, None
+                    handler._forward = forward
+                    handler._post()
+                    if configured:
+                        handler._json.assert_not_called()
+                        self.assertEqual(calls[0]['model'], jev.SOL61)
+                        self.assertEqual(calls[0]['reasoning']['effort'], 'high')
+                        self.assertEqual(logged.call_args.args[0]['decision_source'], 'manual')
+                    else:
+                        self.assertEqual(calls, [])
+                        self.assertEqual(handler._json.call_args.args[0], 400)
+
     def test_off_preserves_project_restrictions_without_provider_state_or_discovered_fallbacks(self):
         policies = ({"native_only": True}, {"no_paid_fallback": True},
                     {"allowed_providers": ["free"]}, {"require_astra_final": True}, None)

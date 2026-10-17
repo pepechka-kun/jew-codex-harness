@@ -21,6 +21,48 @@ class OptionalModelRouting(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.state = Path(tmp.name) / 'state.json'
 
+    def test_unsupported_fixed_identifiers_fail_before_any_routing_work(self):
+        for model in ('unsupported-model', '', 'jev/typo', None, 42, ['auto']):
+            with self.subTest(model=model), ExitStack() as stack:
+                handler = object.__new__(jev.Handler)
+                handler.path = '/v1/responses'
+                handler._body = lambda _: {'model': model, 'input': 'synthetic'}
+                handler._json = mock.Mock()
+                for name in ('_provider_ladder', 'route_lease', 'call_jev_routed'):
+                    stack.enter_context(mock.patch.object(jev, name, side_effect=AssertionError('invalid model must not route')))
+                handler._post()
+                self.assertEqual(handler._json.call_args.args[0], 400)
+                self.assertEqual(handler._json.call_args.args[1]['error']['code'], 'unsupported_model')
+
+    def test_unscoped_automatic_requests_do_not_use_ladder_health(self):
+        for cache_key in (None, '', '   ', 42):
+            for alias in ('auto', 'jev/auto'):
+                with self.subTest(cache_key=cache_key, alias=alias), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                    for name in ('OFF_PATH', 'SHADOW_PATH', 'DEBUG_PATH', 'DRY_STATE_PATH', 'SIGNATURE_PATH'):
+                        stack.enter_context(mock.patch.object(jev, name, str(Path(directory) / name)))
+                    stack.enter_context(mock.patch.object(jev, 'STATE', directory))
+                    stack.enter_context(mock.patch.dict(os.environ, {'JEV_LADDER_MODE': 'active'}))
+                    ladder = Ladder({'providers': [{'id': 'external', 'model': 'gateway/fixed'}]}, Path(directory) / 'state.json')
+                    ladder.advance('earlier', ladder.route('earlier', SOL61, 'medium'), 'model_unavailable', cooldown_seconds=300)
+                    self.assertEqual(ladder.model_candidates(), ())
+                    stack.enter_context(mock.patch.object(jev, '_provider_ladder', return_value=ladder))
+                    stack.enter_context(mock.patch.object(ladder, 'model_candidates', side_effect=AssertionError('native execution cannot use ladder health')))
+                    for name in ('route_lease', 'native_dry', 'remember_cache_model', 'remember_route_lease', 'log_line'):
+                        stack.enter_context(mock.patch.object(jev, name, return_value=None))
+                    stack.enter_context(mock.patch.object(jev, 'load_key', return_value='synthetic'))
+                    stack.enter_context(mock.patch.object(jev, 'call_jev_routed', return_value={'answers': {
+                        key: {'choice': value, 'confidence': .99} for key, value in route_choice('gpt-6-luna', 'low').items()}}))
+                    handler = object.__new__(jev.Handler)
+                    handler.path = '/v1/responses'
+                    handler._body = lambda _: {'model': alias, 'input': 'synthetic', 'prompt_cache_key': cache_key}
+                    handler._json = mock.Mock()
+                    handler._serve_ladder = mock.Mock()
+                    handler._forward = mock.Mock(return_value=(200, 'json', 'application/json', False, None, None))
+                    handler._post()
+                    handler._json.assert_not_called()
+                    handler._serve_ladder.assert_not_called()
+                    self.assertEqual(handler._forward.call_args.args[0]['model'], 'gpt-6-luna')
+
     def test_existing_maps_remain_valid_and_do_not_offer_unmapped_choices(self):
         config = {'providers': [{'id': 'gateway', 'models': {
             model: 'gateway/' + model for model in REQUIRED_NATIVE_MODELS}}]}
@@ -95,7 +137,7 @@ class OptionalModelRouting(unittest.TestCase):
             ladder.advance('prior', route, 'model_unavailable', cooldown_seconds=300)
             handler = object.__new__(jev.Handler)
             handler.path = '/v1/responses'
-            handler._body = lambda _: {'model': 'jev/auto', 'input': 'fixture'}
+            handler._body = lambda _: {'model': 'jev/auto', 'input': 'fixture', 'prompt_cache_key': 'cooled-scope'}
             handler._serve_ladder = mock.Mock()
             handler._json = mock.Mock()
             with mock.patch.dict(os.environ, {'JEV_LADDER_MODE': 'active'}), \
@@ -161,7 +203,7 @@ class OptionalModelRouting(unittest.TestCase):
                     self.assertEqual(ladder.model_candidates(), (ASTRA,))
                     handler = object.__new__(jev.Handler)
                     handler.path = '/v1/responses'
-                    handler._body = lambda _: {'model': 'jev/auto', 'input': 'fixture'}
+                    handler._body = lambda _: {'model': 'jev/auto', 'input': 'fixture', 'prompt_cache_key': 'bounded-scope'}
                     handler._serve_ladder = mock.Mock()
                     handler._json = mock.Mock()
                     with mock.patch.dict(os.environ, {'JEV_LADDER_MODE': 'active'}), \

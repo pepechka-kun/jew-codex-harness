@@ -2212,6 +2212,10 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._body(RESPONSE_MAX_BYTES)
         if payload is None:
             return
+        requested_model = payload.get("model", "jev/auto")
+        if requested_model not in ("auto", "jev/auto") and requested_model not in TIERS:
+            return self._json(400, {"error": {"message": "Unsupported fixed model identifier", "code": "unsupported_model"}})
+        fixed_model = requested_model if requested_model in TIERS else None
         # Our own answer signatures never travel back upstream (see
         # strip_signatures): the model must not read its own route tag.
         stripped = strip_signatures(payload)
@@ -2249,7 +2253,7 @@ class Handler(BaseHTTPRequestHandler):
                 if self._project_policy:
                     self._policy_ladder = Ladder(restrict_project_routes(
                         self._policy_ladder.config, self._project_policy,
-                        final_required(self._project_policy, payload, None)), self._policy_ladder.path)
+                        fixed_model is None and final_required(self._project_policy, payload, None)), self._policy_ladder.path)
             except (OSError, ValueError, RuntimeError):
                 return self._json(503, {"error": {"message": "provider policy unavailable"}})
         affinity = cache_affinity(scope, payload)
@@ -2259,11 +2263,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         leased = route_lease(scope, payload, step)
         available_models = self._policy_ladder.available_models() if self._policy_ladder else TIERS
-        fixed_model = payload.get("model") if payload.get("model") in TIERS else None
-        shadow_routes_native = shadow_enabled and not self._project_policy and fixed_model is None
+        prompt_cache_key = payload.get("prompt_cache_key")
+        uses_ladder = bool(not routing_off and self._policy_ladder and
+            (self._project_policy or fixed_model is not None or
+             (not shadow_enabled and isinstance(prompt_cache_key, str) and prompt_cache_key.strip())))
         try:
             candidates = (self._policy_ladder.model_candidates()
-                          if self._policy_ladder and fixed_model is None and not routing_off and not shadow_routes_native else available_models)
+                          if uses_ladder and fixed_model is None else available_models)
         except (OSError, ValueError, RuntimeError):
             return self._json(503, {"error": {"message": "provider model health unavailable"}})
         models = automatic_models(candidates)
@@ -2273,11 +2279,7 @@ class Handler(BaseHTTPRequestHandler):
         questions = questions_for_models(models)
         if leased and leased["model"] not in models:
             leased = None
-        if self._project_policy and (self._project_policy.get("native_only")
-                                    or (routing_off and final_required(self._project_policy, payload, None))):
-            model, effort, speed, gate = ASTRA, "medium", "default", "project_native_only"
-            decision_source = "project_policy"
-        elif fixed_model is not None:
+        if fixed_model is not None:
             if fixed_model not in available_models:
                 return self._json(400, {"error": {"message": "Requested fixed model is not configured in the provider sequence"}})
             requested_reasoning = payload.get("reasoning")
@@ -2285,6 +2287,10 @@ class Handler(BaseHTTPRequestHandler):
             if effort not in EFFORTS:
                 return self._json(400, {"error": {"message": "Unsupported reasoning effort for fixed model"}})
             model, speed, gate, decision_source = fixed_model, "default", "manual", "manual"
+        elif self._project_policy and (self._project_policy.get("native_only")
+                                      or (routing_off and final_required(self._project_policy, payload, None))):
+            model, effort, speed, gate = ASTRA, "medium", "default", "project_native_only"
+            decision_source = "project_policy"
         elif routing_off:
             model, effort, speed, gate = (SOL if os.environ.get("JEV_DISABLE_AUTO_ASTRA") == "1" else ASTRA), None, "default", "off"
         else:
@@ -2347,7 +2353,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 native = Ladder(restrict_project_routes(self._policy_ladder.config,
                     {**self._project_policy, "native_only": True},
-                    final_required(self._project_policy, payload, decision)), self._policy_ladder.path)
+                    fixed_model is None and final_required(self._project_policy, payload, decision)), self._policy_ladder.path)
                 chosen = native.native_route(model, effort)
                 if chosen is None:
                     raise ValueError("No permitted native route")
@@ -2355,10 +2361,7 @@ class Handler(BaseHTTPRequestHandler):
             except (OSError, ValueError, RuntimeError):
                 return self._json(503, {"error": {"message": "No configured native route satisfies project policy"}})
 
-        if (not routing_off and os.environ.get("JEV_LADDER_MODE") == "active"
-                and (self._project_policy or fixed_model is not None or (not shadow_enabled
-                and isinstance(payload.get("prompt_cache_key"), str)
-                and payload["prompt_cache_key"].strip()))):
+        if uses_ladder:
             return self._serve_ladder(payload, scope, model, effort, decision, step,
                                       jev_usage, stream_requested, debug, t0, jev_ms,
                                       decision_source, routing_gate=gate)
@@ -2570,7 +2573,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             ladder = getattr(self, "_policy_ladder", None) or _provider_ladder()
             policy = resolve_project_policy(ladder.config, scope)
-            required = final_required(policy, payload, decision)
+            required = decision_source != "manual" and final_required(policy, payload, decision)
             if required:
                 base_model = ASTRA
             if policy:
