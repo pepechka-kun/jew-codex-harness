@@ -2367,14 +2367,14 @@ class Handler(BaseHTTPRequestHandler):
                                       decision_source, routing_gate=gate)
 
         would = None
-        if shadow_enabled and not routing_off:
+        if shadow_enabled and not routing_off and fixed_model is None:
             would = {"model": model, "effort": effort, "speed": speed, "gate": gate}
             model, effort, speed, gate = (SOL if os.environ.get("JEV_DISABLE_AUTO_ASTRA") == "1" else ASTRA), None, "default", "shadow(base)"
 
         # ONLY while native usage is exhausted (manual flag or observed quota
         # failure), replace the OpenAI ladder with locally discovered configured
         # routes. Healthy native turns never enumerate providers.
-        dry_reason = native_dry()
+        dry_reason = native_dry() if fixed_model is None else None
         native_model = model
         native_effort = effort or (payload.get("reasoning") or {}).get("effort")
         fallback_plan = []
@@ -2425,10 +2425,10 @@ class Handler(BaseHTTPRequestHandler):
         else:
             status, out_kind, ctype, quota_hit, unwritten, resets_at = self._forward(
                 payload, out_path, stream_requested, debug, marker, model, signature, effort,
-                exact_route=bool(dry_reason and model not in TIERS))
+                exact_route=fixed_model is not None or bool(dry_reason and model not in TIERS))
         retried = False
         fallback = None
-        if quota_hit and not dry_reason:
+        if quota_hit and not dry_reason and fixed_model is None:
             # Native usage is exhausted: discover fallback routes now, then
             # retry this exact canonical call before anything reaches the client.
             mark_native_dry("quota", resets_at=resets_at)
@@ -2447,7 +2447,7 @@ class Handler(BaseHTTPRequestHandler):
                     exact_route=True)
             else:
                 gate = f"codex_dry(no_candidate):{native_model}"
-        elif status == 200 and not dry_reason and model in TIERS and os.path.exists(DRY_STATE_PATH):
+        elif status == 200 and not dry_reason and fixed_model is None and model in TIERS and os.path.exists(DRY_STATE_PATH):
             # Native answered again: drop the stale auto state (never the flag).
             clear_native_dry()
             dry_reason = "cleared"
@@ -2628,6 +2628,13 @@ class Handler(BaseHTTPRequestHandler):
             model = chosen["model"]
             profiles = ladder.config.get("reasoning_profiles")
             resolved = resolve_model_reasoning_effort(model, effort, profiles)
+            if decision_source == "manual" and resolved["effective_effort"] != effort:
+                message = "The configured destination does not support the exact fixed reasoning effort."
+                relay = getattr(self, "_validated_stream", None)
+                if relay:
+                    relay.fail(message, "unsupported_fixed_effort")
+                    return
+                return self._json(400, {"error": {"message": message, "code": "unsupported_fixed_effort"}})
             effective_effort = resolved["effective_effort"]
             # Every retry starts from the client's reasoning, not the previous
             # provider's mapped value. This is confined to automatic routing.

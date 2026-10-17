@@ -34,6 +34,32 @@ class OptionalModelRouting(unittest.TestCase):
                 self.assertEqual(handler._json.call_args.args[0], 400)
                 self.assertEqual(handler._json.call_args.args[1]['error']['code'], 'unsupported_model')
 
+    def test_nonladder_fixed_models_bypass_shadow_and_dry_reselection(self):
+        for mode in ('normal', 'off', 'shadow', 'both', 'quota'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                for name in ('OFF_PATH', 'SHADOW_PATH', 'DEBUG_PATH', 'DRY_STATE_PATH', 'SIGNATURE_PATH'):
+                    stack.enter_context(mock.patch.object(jev, name, str(Path(directory) / name)))
+                if mode in ('off', 'both'): Path(jev.OFF_PATH).touch()
+                if mode in ('shadow', 'both'): Path(jev.SHADOW_PATH).touch()
+                Path(jev.DRY_STATE_PATH).touch()
+                stack.enter_context(mock.patch.object(jev, 'STATE', directory))
+                stack.enter_context(mock.patch.dict(os.environ, {'JEV_LADDER_MODE': 'off'}))
+                for name in ('_provider_ladder', 'call_jev_routed', 'native_dry', 'fallback_candidates', 'mark_native_dry', 'clear_native_dry'):
+                    stack.enter_context(mock.patch.object(jev, name, side_effect=AssertionError('fixed model must not enter automatic recovery')))
+                for name in ('route_lease', 'remember_cache_model', 'remember_route_lease', 'log_line'):
+                    stack.enter_context(mock.patch.object(jev, name, return_value=None))
+                handler = object.__new__(jev.Handler)
+                handler.path = '/v1/responses'
+                handler._body = lambda _: {'model': SOL61, 'input': 'synthetic', 'reasoning': {'effort': 'high'}}
+                handler._json = mock.Mock()
+                handler._forward = mock.Mock(return_value=(429 if mode == 'quota' else 200, 'json', 'application/json', mode == 'quota', None, None))
+                handler._post()
+                handler._json.assert_not_called()
+                handler._forward.assert_called_once()
+                self.assertEqual(handler._forward.call_args.args[0]['model'], SOL61)
+                self.assertEqual(handler._forward.call_args.args[0]['reasoning']['effort'], 'high')
+                self.assertTrue(handler._forward.call_args.kwargs['exact_route'])
+
     def test_unscoped_automatic_requests_do_not_use_ladder_health(self):
         for cache_key in (None, '', '   ', 42):
             for alias in ('auto', 'jev/auto'):

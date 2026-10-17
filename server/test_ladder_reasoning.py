@@ -63,6 +63,41 @@ class LadderConfigReasoningTests(unittest.TestCase):
 
 
 class LadderReasoningIntegrationTests(unittest.TestCase):
+    def test_manual_effort_is_exact_or_rejected_before_forwarding(self):
+        import jev_server as jev
+        for profile in (None, {'supported_efforts': ['high']}, {'supported_efforts': ['low'], 'effort_map': {'high': 'low'}}, {'supported': False}):
+            for stream_started in (False, True):
+                with self.subTest(profile=profile, stream_started=stream_started):
+                    config = {'providers': [{'id': 'native', 'transport': 'native'}],
+                              'reasoning_profiles': {jev.SOL61: profile} if profile else {}}
+                    ladder = Ladder(config, self.state_file)
+                    handler = object.__new__(jev.Handler)
+                    handler._json = mock.Mock()
+                    relay = mock.Mock() if stream_started else None
+                    handler._validated_stream = relay
+                    payload = {'model': jev.SOL61, 'input': 'synthetic', 'reasoning': {'effort': 'high', 'summary': 'auto'}}
+                    calls = []
+                    def forward(body, *args, **kwargs):
+                        calls.append(json.loads(json.dumps(body)))
+                        handler._attempts.append({'model': body['model'], 'terminal_type': 'response.completed'})
+                        return 200, 'json', 'application/json', False, None, None
+                    handler._forward = forward
+                    with mock.patch.object(jev, '_provider_ladder', return_value=ladder):
+                        handler._serve_ladder(payload, 'fixed', jev.SOL61, 'high', None,
+                            {'step_type': 'user_turn'}, None, False, False, decision_source='manual')
+                    if profile and ('low' in profile.get('supported_efforts', []) or profile.get('supported') is False):
+                        self.assertEqual(calls, [])
+                        self.assertEqual(payload['reasoning']['effort'], 'high')
+                        if relay:
+                            self.assertEqual(relay.fail.call_args.args[1], 'unsupported_fixed_effort')
+                            handler._json.assert_not_called()
+                        else:
+                            self.assertEqual(handler._json.call_args.args[0], 400)
+                            self.assertEqual(handler._json.call_args.args[1]['error']['code'], 'unsupported_fixed_effort')
+                    else:
+                        handler._json.assert_not_called()
+                        self.assertEqual(calls[0]['reasoning'], {'effort': 'high', 'summary': 'auto'})
+
     def setUp(self):
         import jev_server
         self.temp_dir = tempfile.TemporaryDirectory()
